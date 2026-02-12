@@ -1,4 +1,3 @@
-# bot.py
 import os
 import time
 import re
@@ -10,6 +9,7 @@ import numpy as np
 import yfinance as yf
 import requests
 from bs4 import BeautifulSoup
+from sklearn.linear_model import LinearRegression
 
 from datetime import datetime, timezone, timedelta
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -22,9 +22,9 @@ from openai import OpenAI
 # ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set. Add it in Variables (BOT_TOKEN).")
+    raise RuntimeError("BOT_TOKEN is not set. Add it in Railway Variables.")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional but recommended
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional, but recommended
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -37,46 +37,41 @@ INTERVAL = "1d"
 NEWS_LOOKBACK_DAYS = 30
 NEWS_LIMIT = 10
 
-# Returns model settings (fixes unrealistic jumps)
-RETURNS_WINDOW_DAYS = 60
-CLAMP_SIGMA_MULT = 2.0
+# ML model settings (Linear Regression on lagged returns)
+LAGS = 5               # number of lag days used as features
+TRAIN_WINDOW = 120     # last N trading days for training (<= data length)
 
 # Cache
 CACHE_TTL_SECONDS = 120
 _cache = {}
 
-# HTTP for excerpt
+# HTTP for news excerpt
 HTTP_TIMEOUT = 8
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 }
 
-# Chat mode memory (per user)
-CHAT_MODE_USERS = set()
-CHAT_HISTORY: Dict[int, List[Dict[str, str]]] = {}  # user_id -> [{"role":"user/assistant","content":...}, ...]
-CHAT_HISTORY_MAX_TURNS = 12  # keep last messages
+# Chat history (optional, small memory) — no "mode", always on
+CHAT_HISTORY: Dict[int, List[Dict[str, str]]] = {}
+CHAT_HISTORY_MAX_TURNS = 10
 
 
 # ======================
-# NEWS RULES (simple scoring)
+# INLINE MENU
 # ======================
-NEWS_RULES = [
-    {"keywords": ["beats earnings", "earnings beat", "revenue beat", "raised guidance", "guidance raised",
-                 "upgrade", "price target raised"], "score": +3, "tag": "Strong positive"},
-    {"keywords": ["partnership", "deal", "contract", "acquisition", "buyback", "share repurchase"],
-     "score": +2, "tag": "Positive catalyst"},
-    {"keywords": ["launch", "released", "new product", "record revenue", "strong demand"],
-     "score": +2, "tag": "Growth signal"},
-    {"keywords": ["expects", "plans", "considering", "announced", "update"], "score": 0, "tag": "Neutral"},
-    {"keywords": ["missed earnings", "earnings miss", "revenue miss", "cut guidance", "guidance cut",
-                 "downgrade", "price target cut"], "score": -3, "tag": "Strong negative"},
-    {"keywords": ["lawsuit", "probe", "investigation", "regulators", "fine", "ban", "antitrust"],
-     "score": -2, "tag": "Legal/regulatory risk"},
-    {"keywords": ["weak demand", "slowdown", "warning", "decline", "fell", "drops"],
-     "score": -2, "tag": "Weakness signal"},
-    {"keywords": ["layoffs", "cuts jobs", "cost cutting"], "score": -1, "tag": "Cost-cutting (mixed)"},
-]
+def main_menu():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📊 Predict META (1D)", callback_data="predict_META_1d"),
+        InlineKeyboardButton("📅 Predict META (7D)", callback_data="predict_META_7d"),
+        InlineKeyboardButton("📊 Predict SNAP (1D)", callback_data="predict_SNAP_1d"),
+        InlineKeyboardButton("📅 Predict SNAP (7D)", callback_data="predict_SNAP_7d"),
+        InlineKeyboardButton("📊 Predict PINS (1D)", callback_data="predict_PINS_1d"),
+        InlineKeyboardButton("📅 Predict PINS (7D)", callback_data="predict_PINS_7d"),
+        InlineKeyboardButton("ℹ️ Status", callback_data="status"),
+    )
+    return kb
 
 
 # ======================
@@ -100,21 +95,17 @@ def cache_set(key: str, val):
 # ======================
 # TEXT HELPERS
 # ======================
-def sanitize_md(text: str) -> str:
-    if not text:
-        return ""
-    return (text.replace("*", "")
-                .replace("_", "")
-                .replace("`", "")
-                .replace("[", "(")
-                .replace("]", ")"))
-
-
 def shorten(text: str, n: int = 240) -> str:
     text = re.sub(r"\s+", " ", (text or "")).strip()
-    if len(text) <= n:
-        return text
-    return text[:n].rstrip() + "…"
+    return text if len(text) <= n else text[:n].rstrip() + "…"
+
+
+def escape_html(s: str) -> str:
+    if not s:
+        return ""
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;"))
 
 
 def parse_predict_command(text: str):
@@ -132,27 +123,12 @@ def parse_predict_command(text: str):
     return ticker, mode
 
 
-# ======================
-# INLINE MENU
-# ======================
-def main_menu():
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("📊 Predict META (1D)", callback_data="predict_META_1d"),
-        InlineKeyboardButton("📅 Predict META (7D)", callback_data="predict_META_7d"),
-        InlineKeyboardButton("📊 Predict SNAP (1D)", callback_data="predict_SNAP_1d"),
-        InlineKeyboardButton("📅 Predict SNAP (7D)", callback_data="predict_SNAP_7d"),
-        InlineKeyboardButton("📊 Predict PINS (1D)", callback_data="predict_PINS_1d"),
-        InlineKeyboardButton("📅 Predict PINS (7D)", callback_data="predict_PINS_7d"),
-        InlineKeyboardButton("💬 Chat mode", callback_data="chat_on"),
-        InlineKeyboardButton("🛑 Exit chat", callback_data="chat_off"),
-        InlineKeyboardButton("ℹ️ Status", callback_data="status"),
-    )
-    return keyboard
+def openai_available() -> bool:
+    return client is not None and bool(OPENAI_API_KEY)
 
 
 # ======================
-# PRICES
+# DATA FROM YAHOO
 # ======================
 def fetch_price_df(ticker: str) -> pd.DataFrame:
     cache_key = f"prices:{ticker}:{HISTORY_PERIOD}:{INTERVAL}"
@@ -167,12 +143,13 @@ def fetch_price_df(ticker: str) -> pd.DataFrame:
 
     if df is None or df.empty:
         raise ValueError("Yahoo Finance returned empty data (try later).")
+
     if "Close" not in df.columns:
         raise ValueError("Yahoo Finance data has no 'Close' column.")
 
     df = df.dropna(subset=["Close"]).copy()
-    if len(df) < 40:
-        raise ValueError("Not enough data (need at least 40 trading days).")
+    if len(df) < 60:
+        raise ValueError("Not enough data (need at least ~60 trading days).")
 
     cache_set(cache_key, df)
     return df
@@ -187,15 +164,30 @@ def compute_rsi(series: pd.Series, period: int = 14) -> float:
     return float(rsi.iloc[-1])
 
 
-def compute_volatility(series: pd.Series, window: int = 14) -> float:
+def compute_volatility_proxy(series: pd.Series, window: int = 14) -> float:
     ret = series.pct_change().dropna()
     vol = ret.abs().rolling(window).mean()
     return float(vol.iloc[-1] * 100.0)
 
 
 # ======================
-# NEWS + EXCERPT
+# NEWS (Yahoo via yfinance) + excerpt scraping
 # ======================
+NEWS_RULES = [
+    {"keywords": ["beats earnings", "earnings beat", "revenue beat", "raised guidance", "guidance raised",
+                  "upgrade", "price target raised"], "score": +3, "tag": "Strong positive"},
+    {"keywords": ["partnership", "deal", "contract", "acquisition", "buyback", "share repurchase"],
+     "score": +2, "tag": "Positive catalyst"},
+    {"keywords": ["launch", "released", "new product", "record revenue", "strong demand"],
+     "score": +2, "tag": "Growth signal"},
+    {"keywords": ["missed earnings", "earnings miss", "revenue miss", "cut guidance", "guidance cut",
+                  "downgrade", "price target cut"], "score": -3, "tag": "Strong negative"},
+    {"keywords": ["lawsuit", "probe", "investigation", "regulators", "fine", "ban", "antitrust"],
+     "score": -2, "tag": "Legal/regulatory risk"},
+    {"keywords": ["weak demand", "slowdown", "warning", "decline", "fell", "drops"],
+     "score": -2, "tag": "Weakness signal"},
+]
+
 def fetch_news_yahoo(ticker: str) -> list[dict]:
     cache_key = f"newslist:{ticker}"
     cached = cache_get(cache_key)
@@ -211,9 +203,7 @@ def fetch_news_yahoo(ticker: str) -> list[dict]:
         except Exception:
             news = []
 
-    if not news:
-        news = []
-
+    news = news or []
     cache_set(cache_key, news)
     return news
 
@@ -231,20 +221,19 @@ def fetch_news_excerpt(url: str) -> str:
         if r.status_code >= 400:
             cache_set(cache_key, "")
             return ""
-
         soup = BeautifulSoup(r.text, "html.parser")
 
         og = soup.find("meta", attrs={"property": "og:description"})
         if og and og.get("content"):
-            excerpt = shorten(og.get("content", ""), 260)
-            cache_set(cache_key, excerpt)
-            return excerpt
+            ex = shorten(og.get("content", ""), 260)
+            cache_set(cache_key, ex)
+            return ex
 
         desc = soup.find("meta", attrs={"name": "description"})
         if desc and desc.get("content"):
-            excerpt = shorten(desc.get("content", ""), 260)
-            cache_set(cache_key, excerpt)
-            return excerpt
+            ex = shorten(desc.get("content", ""), 260)
+            cache_set(cache_key, ex)
+            return ex
 
     except Exception:
         pass
@@ -268,10 +257,9 @@ def analyze_news(news: list[dict], lookback_days: int = 30, limit: int = 10):
             continue
 
         link = n.get("link") or n.get("url") or ""
-        publisher = n.get("publisher") or ""
-
         score = 0
         tags = []
+
         for rule in NEWS_RULES:
             for kw in rule["keywords"]:
                 if kw in title_l:
@@ -283,7 +271,6 @@ def analyze_news(news: list[dict], lookback_days: int = 30, limit: int = 10):
 
         items.append({
             "title": raw_title,
-            "publisher": publisher,
             "link": link,
             "ts": ts if isinstance(ts, int) else 0,
             "score": int(score),
@@ -303,148 +290,174 @@ def analyze_news(news: list[dict], lookback_days: int = 30, limit: int = 10):
 
 
 # ======================
-# RETURNS-BASED PREDICTOR
+# ML PREDICTOR (AI MODEL): Linear Regression on lagged returns
 # ======================
-def predict_prices(ticker: str, days: int):
+def train_lr_on_returns(returns: pd.Series, lags: int = 5) -> Tuple[LinearRegression, float]:
+    """
+    Build supervised dataset:
+    X_t = [r_{t-1}, r_{t-2}, ... r_{t-lags}]
+    y_t = r_t
+    """
+    r = returns.values
+    X, y = [], []
+    for i in range(lags, len(r)):
+        X.append(r[i-lags:i][::-1])  # most recent first
+        y.append(r[i])
+    X = np.array(X)
+    y = np.array(y)
+
+    model = LinearRegression()
+    model.fit(X, y)
+    r2 = float(model.score(X, y)) if len(y) > 5 else 0.0
+    return model, r2
+
+
+def predict_prices_ml_lr(ticker: str, days: int) -> Tuple[List[float], float, float, float, float, List[pd.Timestamp], float, float]:
+    """
+    Returns:
+    preds_prices, last_price, r2, mu, sigma, future_dates, rsi, vol_proxy
+    """
     df = fetch_price_df(ticker)
     close = pd.to_numeric(df["Close"], errors="coerce").dropna()
 
+    # Use last TRAIN_WINDOW returns for training
     returns = close.pct_change().dropna()
-    if len(returns) < 20:
-        raise ValueError("Not enough returns data.")
+    if len(returns) < (LAGS + 30):
+        raise ValueError(f"Not enough returns to train ML model (need > {LAGS+30} days).")
 
-    window = min(RETURNS_WINDOW_DAYS, len(returns))
-    r = returns.iloc[-window:]
+    returns = returns.iloc[-min(TRAIN_WINDOW, len(returns)):]
+    model, r2 = train_lr_on_returns(returns, lags=LAGS)
 
-    mu = float(r.mean())       # mean daily return
-    sigma = float(r.std())     # daily volatility (std)
-    if not np.isfinite(sigma) or sigma <= 0:
-        sigma = 0.01
+    mu = float(returns.mean())
+    sigma = float(returns.std()) if float(returns.std()) > 0 else 0.01
 
     last_price = float(close.iloc[-1])
 
-    max_step = CLAMP_SIGMA_MULT * sigma
+    # Start state: last LAGS returns
+    state = list(returns.values[-LAGS:])[::-1]  # most recent first
 
-    preds = []
+    preds_prices = []
     cur = last_price
+
+    # Simple safety clamp to avoid insane steps (still ML, just risk control)
+    clamp = 2.5 * sigma
+
     for _ in range(days):
-        step = max(-max_step, min(max_step, mu))
-        cur = cur * (1.0 + step)
-        preds.append(float(cur))
+        x = np.array(state).reshape(1, -1)
+        pred_r = float(model.predict(x)[0])
+        pred_r = max(-clamp, min(clamp, pred_r))
+
+        cur = cur * (1.0 + pred_r)
+        preds_prices.append(float(cur))
+
+        # update state
+        state = [pred_r] + state[:-1]
 
     last_date = close.index[-1]
     future_dates = pd.bdate_range(last_date + pd.Timedelta(days=1), periods=days).to_list()
 
     rsi = compute_rsi(close, 14)
-    vol_pct = compute_volatility(close, 14)
+    vol_proxy = compute_volatility_proxy(close, 14)
 
-    stability = float(max(0.0, min(1.0, 1.0 - (sigma * 10.0))))
-    drift = mu  # mean return used as "trend"
-
-    return preds, last_price, stability, drift, future_dates, rsi, vol_pct, sigma, mu
+    return preds_prices, last_price, r2, mu, sigma, future_dates, rsi, vol_proxy
 
 
 # ======================
-# OPENAI: explanation + chat
+# OPENAI: explain forecast + general assistant replies
 # ======================
-def openai_available() -> bool:
-    return client is not None and bool(OPENAI_API_KEY)
-
-
 def llm_explain_prediction(
     ticker: str,
     mode: str,
     last_price: float,
     preds: List[float],
-    drift: float,
+    r2: float,
+    mu: float,
     sigma: float,
     rsi: float,
-    vol_pct: float,
+    vol_proxy: float,
     news_top: List[dict],
 ) -> str:
-    """
-    Uses OpenAI to generate a human explanation based ONLY on provided data.
-    """
     if not openai_available():
-        return ""  # no LLM text
+        return ""
 
     dayN = preds[-1]
     direction = "UP" if dayN > last_price else "DOWN"
     delta = dayN - last_price
 
-    # Prepare compact news context (no hallucinations)
-    news_block_lines = []
+    # compact news context
+    news_lines = []
     for it in news_top[:3]:
-        title = sanitize_md(it.get("title", ""))
-        excerpt = sanitize_md(it.get("excerpt", ""))
+        title = it.get("title", "")
+        excerpt = it.get("excerpt", "")
         score = it.get("score", 0)
-        tag = ", ".join(it.get("tags", [])) if it.get("tags") else "Unclassified"
-        news_block_lines.append(f"- title: {title}\n  tag: {tag}\n  score: {score}\n  excerpt: {shorten(excerpt, 220)}")
-
-    news_block = "\n".join(news_block_lines) if news_block_lines else "NO RECENT NEWS ITEMS AVAILABLE."
+        tags = ", ".join(it.get("tags", [])) if it.get("tags") else "Unclassified"
+        news_lines.append(
+            f"- title: {title}\n  tags: {tags}\n  score: {score}\n  excerpt: {shorten(excerpt, 220)}"
+        )
+    news_block = "\n".join(news_lines) if news_lines else "NO RECENT NEWS ITEMS AVAILABLE."
 
     prompt = f"""
-You are a finance assistant for an educational Telegram bot.
-Your job: explain the bot's forecast in a logical, honest way, using ONLY the data provided below.
-Do NOT invent news or numbers. If news is missing, say it clearly.
+You are helping explain a stock forecast for an educational Telegram bot.
+IMPORTANT:
+- Use ONLY the data provided below.
+- Do NOT invent news or numbers.
+- Be honest about limitations.
 
-Output format:
-1) "Summary" (2-3 lines)
-2) "Why it may move" (3-6 bullet points)
-3) "Risks / limits" (2-4 bullet points)
-Keep it concise.
+Write in English. Keep it concise.
 
 DATA:
 ticker: {ticker}
 horizon: {mode}
 last_close: {last_price:.2f}
-dayN_prediction: {dayN:.2f}
+prediction_end: {dayN:.2f}
 delta: {delta:+.2f}
 direction: {direction}
 
-returns_model:
-- drift (mean daily return): {drift*100:.3f}%
-- sigma (daily volatility std): {sigma*100:.3f}%
-- clamp: +/- {CLAMP_SIGMA_MULT} * sigma
+AI model used for forecast:
+- Model: Linear Regression (trained on lagged daily returns, autoregressive features)
+- R2 on training: {r2*100:.1f}%
+- mean daily return (mu): {mu*100:.3f}%
+- daily volatility (sigma): {sigma*100:.3f}%
 
-indicators:
+Indicators:
 - RSI(14): {rsi:.1f}
-- avg_abs_return_14d (volatility proxy): {vol_pct:.2f}%
+- avg_abs_return_14d: {vol_proxy:.2f}%
 
-news_items (top, with excerpts):
+News (titles + excerpts):
 {news_block}
+
+Output format:
+1) Summary (2 lines)
+2) Why it may move (4-7 bullets)
+3) Risks/limits (3-5 bullets)
 """.strip()
 
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Be precise, do not hallucinate. Educational tone."},
+                {"role": "system", "content": "Be precise. No hallucinations. Educational tone."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
         )
-        text = resp.choices[0].message.content.strip()
-        return text
+        return resp.choices[0].message.content.strip()
     except Exception:
         return ""
 
 
-def llm_chat_reply(user_id: int, user_text: str) -> str:
+def llm_assistant_reply(user_id: int, user_text: str) -> str:
     if not openai_available():
-        return "OpenAI API is not configured. Add OPENAI_API_KEY in Railway Variables."
+        return "OpenAI is not configured. Add OPENAI_API_KEY in Railway Variables."
 
-    history = CHAT_HISTORY.get(user_id, [])
-    history.append({"role": "user", "content": user_text})
+    hist = CHAT_HISTORY.get(user_id, [])
+    hist.append({"role": "user", "content": user_text})
 
-    # Trim history
-    if len(history) > CHAT_HISTORY_MAX_TURNS * 2:
-        history = history[-CHAT_HISTORY_MAX_TURNS * 2 :]
+    if len(hist) > CHAT_HISTORY_MAX_TURNS * 2:
+        hist = hist[-CHAT_HISTORY_MAX_TURNS * 2 :]
 
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant inside a Telegram bot. Keep answers short and clear."},
-        *history
-    ]
+    messages = [{"role": "system", "content": "You are a helpful assistant inside a Telegram bot. Keep answers clear and not too long."}]
+    messages += hist
 
     try:
         resp = client.chat.completions.create(
@@ -452,174 +465,148 @@ def llm_chat_reply(user_id: int, user_text: str) -> str:
             messages=messages,
             temperature=0.6,
         )
-        answer = resp.choices[0].message.content.strip()
-        history.append({"role": "assistant", "content": answer})
-        CHAT_HISTORY[user_id] = history
-        return answer
+        ans = resp.choices[0].message.content.strip()
+        hist.append({"role": "assistant", "content": ans})
+        CHAT_HISTORY[user_id] = hist
+        return ans
     except Exception as e:
         return f"OpenAI error: {e}"
 
 
 # ======================
-# LOGIC ENGINE (scores)
+# OUTPUT TEXT
 # ======================
-def score_trend(drift: float) -> Tuple[int, str]:
-    if drift > 0:
-        return 2, f"Average daily return is positive ({drift*100:.2f}%) → upward bias."
-    if drift < 0:
-        return -2, f"Average daily return is negative ({drift*100:.2f}%) → downward bias."
-    return 0, "Average daily return is near zero → no clear trend."
-
-
-def score_rsi(rsi: float) -> Tuple[int, str]:
-    if rsi >= 70:
-        return -1, f"RSI is high ({rsi:.1f}) → overbought (pullback risk)."
-    if rsi <= 30:
-        return +1, f"RSI is low ({rsi:.1f}) → oversold (bounce potential)."
-    return 0, f"RSI is normal ({rsi:.1f}) → neutral."
-
-
-def score_vol(vol_pct: float) -> Tuple[int, str]:
-    if vol_pct >= 3.0:
-        return 0, f"Volatility is high (~{vol_pct:.2f}% daily) → higher uncertainty."
-    return 0, f"Volatility is moderate (~{vol_pct:.2f}% daily)."
-
-
-def score_news(avg_score: float, used_count: int) -> Tuple[int, str]:
-    if used_count == 0:
-        return 0, "No usable recent news → neutral."
-    if avg_score >= 1.0:
-        return +2, f"News looks bullish (avg score {avg_score:+.2f})."
-    if avg_score <= -1.0:
-        return -2, f"News looks bearish (avg score {avg_score:+.2f})."
-    return 0, f"News is mixed/neutral (avg score {avg_score:+.2f})."
-
-
-def logical_conclusion(total_score: int) -> str:
-    if total_score >= 3:
-        return "✅ Conclusion: *Bullish bias* (more factors support growth)."
-    if total_score <= -3:
-        return "✅ Conclusion: *Bearish bias* (more factors support decline)."
-    return "✅ Conclusion: *Mixed / uncertain* (signals conflict or are weak)."
-
-
-def build_rule_based_reasoning(drift: float, rsi: float, vol_pct: float, avg_news: float, used_news: int) -> str:
-    t_score, t_txt = score_trend(drift)
-    r_score, r_txt = score_rsi(rsi)
-    v_score, v_txt = score_vol(vol_pct)
-    n_score, n_txt = score_news(avg_news, used_news)
-    total = t_score + r_score + v_score + n_score
-
-    return "\n".join([
-        "🧠 *Rule-based factors:*",
-        f"• Trend: {t_txt} (score {t_score:+d})",
-        f"• RSI: {r_txt} (score {r_score:+d})",
-        f"• Volatility: {v_txt} (score {v_score:+d})",
-        f"• News: {n_txt} (score {n_score:+d})",
-        "",
-        logical_conclusion(total),
-    ])
-
-
-# ======================
-# OUTPUT
-# ======================
-def build_predict_text(
+def build_predict_text_html(
     ticker: str,
     mode: str,
     preds: List[float],
     last_price: float,
-    stability: float,
-    future_dates: List,
+    r2: float,
+    future_dates: List[pd.Timestamp],
     rule_reasoning: str,
-    llm_reasoning: str,
+    ai_reasoning: str,
 ) -> str:
     kz_time = datetime.now(timezone.utc) + timedelta(hours=5)
 
     if mode == "1d":
         predicted = preds[0]
-        direction = "📈 UP" if predicted > last_price else "📉 DOWN"
         delta = predicted - last_price
-        text = (
-            f"*{ticker} Predict (1D)*\n\n"
-            f"Last close: `{last_price:.2f}`\n"
-            f"Predicted next close: `{predicted:.2f}`\n"
-            f"Move (approx): `{delta:+.2f}`\n"
-            f"Direction: {direction}\n"
-            f"Stability score: `{stability*100:.1f}%`\n\n"
+        direction = "UP" if predicted > last_price else "DOWN"
+
+        header = f"<b>{ticker} Predict (1D)</b>\n\n"
+        stats = (
+            f"Last close: <code>{last_price:.2f}</code>\n"
+            f"Predicted next close: <code>{predicted:.2f}</code>\n"
+            f"Move (approx): <code>{delta:+.2f}</code>\n"
+            f"Direction: <b>{direction}</b>\n"
+            f"Model (Linear Regression) R²: <code>{r2*100:.1f}%</code>\n\n"
         )
     else:
         dayN = preds[-1]
-        direction = "📈 UP" if dayN > last_price else "📉 DOWN"
         deltaN = dayN - last_price
-        rows = [f"• {d.strftime('%Y-%m-%d')}: `{p:.2f}`" for d, p in zip(future_dates, preds)]
-        path = "\n".join(rows)
+        direction = "UP" if dayN > last_price else "DOWN"
 
-        text = (
-            f"*{ticker} Predict (7D)*\n\n"
-            f"Last close: `{last_price:.2f}`\n"
-            f"Day 7 prediction: `{dayN:.2f}`\n"
-            f"Move (approx): `{deltaN:+.2f}`\n"
-            f"Direction (vs last): {direction}\n"
-            f"Stability score: `{stability*100:.1f}%`\n\n"
-            f"*Next predicted closes:*\n{path}\n\n"
+        header = f"<b>{ticker} Predict (7D)</b>\n\n"
+        stats = (
+            f"Last close: <code>{last_price:.2f}</code>\n"
+            f"Day 7 prediction: <code>{dayN:.2f}</code>\n"
+            f"Move (approx): <code>{deltaN:+.2f}</code>\n"
+            f"Direction: <b>{direction}</b>\n"
+            f"Model (Linear Regression) R²: <code>{r2*100:.1f}%</code>\n\n"
         )
 
-    text += rule_reasoning
+        path_lines = []
+        for d, p in zip(future_dates, preds):
+            path_lines.append(f"• {d.strftime('%Y-%m-%d')}: <code>{p:.2f}</code>")
+        path = "<b>Next predicted closes:</b>\n" + "\n".join(path_lines) + "\n\n"
 
-    # Add LLM reasoning only if present (prevents empty blocks)
-    if llm_reasoning.strip():
-        text += "\n\n🤖 *AI explanation (OpenAI):*\n" + sanitize_md(llm_reasoning)
+        stats += path
 
-    text += f"\n\n⏱ {kz_time.strftime('%Y-%m-%d %H:%M')}"
+    text = header + stats
+    text += "<b>Logic (rules + indicators):</b>\n" + escape_html(rule_reasoning) + "\n"
+
+    if ai_reasoning.strip():
+        text += "\n<b>AI explanation (OpenAI):</b>\n" + escape_html(ai_reasoning) + "\n"
+
+    text += f"\n⏱ {kz_time.strftime('%Y-%m-%d %H:%M')}"
     return text
 
 
-def usage_text() -> str:
+def rule_based_reasoning(mu: float, sigma: float, rsi: float, vol_proxy: float, news_avg: float, news_count: int) -> str:
+    # Simple, transparent reasoning
+    trend = "upward" if mu > 0 else "downward" if mu < 0 else "flat"
+    trend_score = 1 if mu > 0 else -1 if mu < 0 else 0
+
+    rsi_score = -1 if rsi >= 70 else 1 if rsi <= 30 else 0
+    rsi_txt = "overbought (pullback risk)" if rsi >= 70 else "oversold (bounce potential)" if rsi <= 30 else "neutral"
+
+    news_score = 0
+    if news_count == 0:
+        news_txt = "no usable recent news (neutral)"
+    else:
+        if news_avg >= 1.0:
+            news_score = 2
+            news_txt = f"bullish average score ({news_avg:+.2f})"
+        elif news_avg <= -1.0:
+            news_score = -2
+            news_txt = f"bearish average score ({news_avg:+.2f})"
+        else:
+            news_txt = f"mixed/neutral average score ({news_avg:+.2f})"
+
+    total = trend_score + rsi_score + news_score
+
+    if total >= 2:
+        concl = "Bullish bias"
+    elif total <= -2:
+        concl = "Bearish bias"
+    else:
+        concl = "Mixed / uncertain"
+
     return (
-        "✅ Use:\n"
-        "• `/predict META 1d`\n"
-        "• `/predict META 7d`\n"
-        "• `/chat` to talk to the AI assistant\n\n"
-        f"Allowed: {', '.join(sorted(ALLOWED_TICKERS))}"
+        f"- Trend (mu): {mu*100:.3f}% daily → {trend}\n"
+        f"- Volatility (sigma): {sigma*100:.3f}% daily\n"
+        f"- RSI(14): {rsi:.1f} → {rsi_txt}\n"
+        f"- Volatility proxy (avg abs return 14d): {vol_proxy:.2f}%\n"
+        f"- News: {news_txt}\n"
+        f"Conclusion: {concl}"
     )
 
 
 # ======================
-# CORE
+# CORE PREDICT
 # ======================
 def do_predict(ticker: str, mode: str) -> str:
     days = 1 if mode == "1d" else 7
-    preds, last_price, stability, drift, future_dates, rsi, vol_pct, sigma, mu = predict_prices(ticker, days=days)
+
+    preds, last_price, r2, mu, sigma, future_dates, rsi, vol_proxy = predict_prices_ml_lr(ticker, days=days)
 
     news = fetch_news_yahoo(ticker)
-    avg_score, top_items, used_count = analyze_news(news, lookback_days=NEWS_LOOKBACK_DAYS, limit=NEWS_LIMIT)
+    news_avg, top_items, used_count = analyze_news(news, lookback_days=NEWS_LOOKBACK_DAYS, limit=NEWS_LIMIT)
 
-    rule_reasoning = build_rule_based_reasoning(
-        drift=drift, rsi=rsi, vol_pct=vol_pct, avg_news=avg_score, used_news=used_count
-    )
+    rule_reason = rule_based_reasoning(mu, sigma, rsi, vol_proxy, news_avg, used_count)
 
-    llm_reasoning = llm_explain_prediction(
+    ai_reason = llm_explain_prediction(
         ticker=ticker,
         mode=mode,
         last_price=last_price,
         preds=preds,
-        drift=drift,
+        r2=r2,
+        mu=mu,
         sigma=sigma,
         rsi=rsi,
-        vol_pct=vol_pct,
+        vol_proxy=vol_proxy,
         news_top=top_items,
     )
 
-    return build_predict_text(
+    return build_predict_text_html(
         ticker=ticker,
         mode=mode,
         preds=preds,
         last_price=last_price,
-        stability=stability,
+        r2=r2,
         future_dates=future_dates,
-        rule_reasoning=rule_reasoning,
-        llm_reasoning=llm_reasoning,
+        rule_reasoning=rule_reason,
+        ai_reasoning=ai_reason,
     )
 
 
@@ -628,52 +615,31 @@ def do_predict(ticker: str, mode: str) -> str:
 # ======================
 @bot.message_handler(commands=["start"])
 def start(message):
-    bot.send_message(
-        message.chat.id,
-        "**⚠️ DISCLAIMER ⚠️**\n\n"
-        "**THIS BOT IS CREATED FOR EXPERIMENTAL AND EDUCATIONAL PURPOSES ONLY.**\n"
-        "**IT DOES NOT PROVIDE FINANCIAL ADVICE.**\n"
-        "**DO NOT MAKE INVESTMENT DECISIONS BASED SOLELY ON THIS BOT.**\n\n"
-        "Market predictions are uncertain and may be inaccurate.\n"
-        "Always do your own research and consult professional advisors.\n\n"
-        "----------------------------------\n\n"
-        "👋 *Welcome to Predict AI*\n\n"
+    text = (
+        "⚠️ <b>DISCLAIMER</b> ⚠️\n\n"
+        "<b>THIS BOT IS CREATED FOR EXPERIMENTAL AND EDUCATIONAL PURPOSES ONLY.</b>\n"
+        "<b>IT DOES NOT PROVIDE FINANCIAL ADVICE.</b>\n"
+        "<b>DO NOT MAKE INVESTMENT DECISIONS BASED SOLELY ON THIS BOT.</b>\n\n"
         "Commands:\n"
-        "• `/predict META 1d`\n"
-        "• `/predict META 7d`\n"
-        "• `/chat` (talk to AI assistant)\n"
-        "• `/exit` (exit chat)\n\n"
-        "Or use the menu buttons below 👇",
-        reply_markup=main_menu(),
-        parse_mode="Markdown"
+        "• <code>/predict META 1d</code>\n"
+        "• <code>/predict META 7d</code>\n\n"
+        "You can also ask questions in normal text (the bot will answer with OpenAI if configured).\n"
     )
+    bot.send_message(message.chat.id, text, reply_markup=main_menu(), parse_mode="HTML")
 
 
 @bot.message_handler(commands=["status"])
 def status(message):
     ai_status = "✅ OpenAI enabled" if openai_available() else "❌ OpenAI not configured (set OPENAI_API_KEY)"
-    bot.reply_to(
-        message,
-        f"✅ Bot RUNNING\nSource: Yahoo Finance\nTickers: {', '.join(sorted(ALLOWED_TICKERS))}\n"
-        "Command: /predict <TICKER> <1d|7d>\n"
-        f"News lookback: {NEWS_LOOKBACK_DAYS} days\n"
+    txt = (
+        f"✅ Bot RUNNING\n"
+        f"Source: Yahoo Finance\n"
+        f"Tickers: {', '.join(sorted(ALLOWED_TICKERS))}\n"
+        f"Predict command: /predict <TICKER> <1d|7d>\n"
+        f"Model: Linear Regression (lagged returns)\n"
         f"{ai_status}"
     )
-
-
-@bot.message_handler(commands=["chat"])
-def chat_on(message):
-    CHAT_MODE_USERS.add(message.from_user.id)
-    bot.send_message(
-        message.chat.id,
-        "💬 Chat mode is ON.\nSend any message and I will answer like ChatGPT.\nType /exit to stop."
-    )
-
-
-@bot.message_handler(commands=["exit"])
-def chat_off(message):
-    CHAT_MODE_USERS.discard(message.from_user.id)
-    bot.send_message(message.chat.id, "🛑 Chat mode is OFF. Use /predict to get forecasts.")
+    bot.send_message(message.chat.id, txt)
 
 
 @bot.message_handler(commands=["predict"])
@@ -681,7 +647,10 @@ def predict_command(message):
     ticker, mode = parse_predict_command(message.text)
 
     if ticker is None and mode is None:
-        bot.send_message(message.chat.id, usage_text(), parse_mode="Markdown")
+        bot.send_message(
+            message.chat.id,
+            "Use: /predict META 1d  OR  /predict META 7d\nAllowed: " + ", ".join(sorted(ALLOWED_TICKERS))
+        )
         return
 
     if ticker not in ALLOWED_TICKERS:
@@ -689,30 +658,26 @@ def predict_command(message):
         return
 
     if mode not in {"1d", "7d"}:
-        bot.send_message(message.chat.id, "Mode must be `1d` or `7d`.\n\n" + usage_text(), parse_mode="Markdown")
+        bot.send_message(message.chat.id, "Mode must be 1d or 7d. Example: /predict META 7d")
         return
 
     try:
         text = do_predict(ticker, mode)
-        bot.send_message(message.chat.id, text, parse_mode="Markdown")
+        bot.send_message(message.chat.id, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         bot.send_message(message.chat.id, f"Error: {e}")
 
 
+# Any other message -> OpenAI assistant reply (no mode)
 @bot.message_handler(func=lambda m: True)
-def any_message(message):
-    # If user is in chat mode -> OpenAI
-    if message.from_user.id in CHAT_MODE_USERS:
-        reply = llm_chat_reply(message.from_user.id, message.text)
-        bot.send_message(message.chat.id, reply)
+def any_text(message):
+    # If user types something that looks like /predict but wrong format:
+    if message.text and message.text.strip().startswith("/predict"):
+        bot.send_message(message.chat.id, "Format: /predict META 1d  OR  /predict META 7d")
         return
 
-    # Otherwise show a hint
-    bot.send_message(
-        message.chat.id,
-        "Use `/predict META 1d` or `/predict META 7d`.\n"
-        "Or type `/chat` to talk to the AI assistant."
-    )
+    reply = llm_assistant_reply(message.from_user.id, message.text or "")
+    bot.send_message(message.chat.id, reply)
 
 
 # ======================
@@ -725,21 +690,8 @@ def callback_handler(call):
             ai_status = "✅ OpenAI enabled" if openai_available() else "❌ OpenAI not configured (set OPENAI_API_KEY)"
             bot.send_message(
                 call.message.chat.id,
-                f"✅ Bot RUNNING\nSource: Yahoo Finance\nTickers: {', '.join(sorted(ALLOWED_TICKERS))}\n"
-                "Command: /predict <TICKER> <1d|7d>\n"
-                f"News lookback: {NEWS_LOOKBACK_DAYS} days\n"
-                f"{ai_status}"
+                f"✅ Bot RUNNING\nTickers: {', '.join(sorted(ALLOWED_TICKERS))}\nModel: Linear Regression (lagged returns)\n{ai_status}"
             )
-            return
-
-        if call.data == "chat_on":
-            CHAT_MODE_USERS.add(call.from_user.id)
-            bot.send_message(call.message.chat.id, "💬 Chat mode is ON. Type /exit to stop.")
-            return
-
-        if call.data == "chat_off":
-            CHAT_MODE_USERS.discard(call.from_user.id)
-            bot.send_message(call.message.chat.id, "🛑 Chat mode is OFF.")
             return
 
         if call.data.startswith("predict_"):
@@ -752,7 +704,7 @@ def callback_handler(call):
                 return
 
             text = do_predict(ticker, mode)
-            bot.send_message(call.message.chat.id, text, parse_mode="Markdown")
+            bot.send_message(call.message.chat.id, text, parse_mode="HTML", disable_web_page_preview=True)
             return
 
     except Exception as e:
@@ -763,5 +715,5 @@ def callback_handler(call):
 # RUN
 # ======================
 if __name__ == "__main__":
-    print("Bot started ✅ (returns-based predictor + Yahoo news + OpenAI chat/explain)")
+    print("Bot started ✅ (ML Linear Regression predictor + OpenAI assistant)")
     bot.infinity_polling()
