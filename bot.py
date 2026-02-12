@@ -10,6 +10,7 @@ import yfinance as yf
 import requests
 from bs4 import BeautifulSoup
 from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error
 
 from datetime import datetime, timezone, timedelta
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -40,6 +41,9 @@ NEWS_LIMIT = 10
 # ML model settings (Linear Regression on lagged returns)
 LAGS = 5               # number of lag days used as features
 TRAIN_WINDOW = 120     # last N trading days for training (<= data length)
+
+# MAE Backtest settings (simple walk-forward)
+MAE_TEST_POINTS = 20   # number of recent origins to evaluate MAE on (keep small for speed)
 
 # Cache
 CACHE_TTL_SECONDS = 120
@@ -188,6 +192,7 @@ NEWS_RULES = [
      "score": -2, "tag": "Weakness signal"},
 ]
 
+
 def fetch_news_yahoo(ticker: str) -> list[dict]:
     cache_key = f"newslist:{ticker}"
     cached = cache_get(cache_key)
@@ -312,10 +317,96 @@ def train_lr_on_returns(returns: pd.Series, lags: int = 5) -> Tuple[LinearRegres
     return model, r2
 
 
-def predict_prices_ml_lr(ticker: str, days: int) -> Tuple[List[float], float, float, float, float, List[pd.Timestamp], float, float]:
+def backtest_mae_price(
+    close: pd.Series,
+    horizon_days: int,
+    lags: int = 5,
+    train_window: int = 120,
+    test_points: int = 20,
+) -> Tuple[float, float]:
+    """
+    Simple walk-forward MAE in PRICE units and percent.
+    - For each origin i, we train on returns up to i (no lookahead),
+      predict price at i + horizon_days using iterative returns,
+      compare with actual close at i + horizon_days.
+    Returns: (mae_price, mae_percent)
+    """
+    close = pd.to_numeric(close, errors="coerce").dropna()
+    if len(close) < (lags + 40 + horizon_days):
+        return float("nan"), float("nan")
+
+    # returns aligned to close index (return at t = close[t]/close[t-1] - 1)
+    returns = close.pct_change().dropna()
+    r = returns.values
+    c = close.values  # close[0..N-1]
+
+    N = len(close) - 1  # last index in close array
+
+    # valid origins i: need i >= lags and i + horizon_days <= N
+    last_origin = N - horizon_days
+    first_origin = max(lags, last_origin - test_points + 1)
+    if first_origin > last_origin:
+        return float("nan"), float("nan")
+
+    preds = []
+    actuals = []
+
+    # helper: predict horizon returns starting from state at origin i
+    for i in range(first_origin, last_origin + 1):
+        # known returns go from index 1..i (because return[1] uses close[0]->close[1])
+        # in returns array r, its indices are 0..len(returns)-1 corresponding to close[1..]
+        # close index i corresponds to returns index i-1
+        end_r_idx = i - 1
+        if end_r_idx < lags:
+            continue
+
+        # training returns slice ends at end_r_idx inclusive
+        train_end = end_r_idx
+        train_start = max(0, train_end - train_window + 1)
+        train_returns = pd.Series(r[train_start:train_end + 1])
+
+        if len(train_returns) < (lags + 10):
+            continue
+
+        model, _ = train_lr_on_returns(train_returns, lags=lags)
+
+        # state = last lags returns ending at i (most recent first)
+        state = list(r[train_end - lags + 1: train_end + 1])[::-1]
+
+        # volatility clamp from training returns
+        sigma = float(np.std(train_returns.values))
+        clamp = 2.5 * sigma if sigma > 0 else 0.02
+
+        cur_price = float(c[i])
+
+        # iterative multi-step prediction
+        for _ in range(horizon_days):
+            x = np.array(state).reshape(1, -1)
+            pred_r = float(model.predict(x)[0])
+            pred_r = max(-clamp, min(clamp, pred_r))
+            cur_price = cur_price * (1.0 + pred_r)
+            state = [pred_r] + state[:-1]
+
+        pred_price = float(cur_price)
+        actual_price = float(c[i + horizon_days])
+
+        preds.append(pred_price)
+        actuals.append(actual_price)
+
+    if len(actuals) < 5:
+        return float("nan"), float("nan")
+
+    mae_price = float(mean_absolute_error(actuals, preds))
+    mae_percent = float(np.mean(np.abs((np.array(preds) - np.array(actuals)) / np.array(actuals))) * 100.0)
+    return mae_price, mae_percent
+
+
+def predict_prices_ml_lr(
+    ticker: str, days: int
+) -> Tuple[List[float], float, float, float, float, List[pd.Timestamp], float, float, float, float]:
     """
     Returns:
-    preds_prices, last_price, r2, mu, sigma, future_dates, rsi, vol_proxy
+    preds_prices, last_price, r2, mu, sigma, future_dates, rsi, vol_proxy, mae_price, mae_percent
     """
     df = fetch_price_df(ticker)
     close = pd.to_numeric(df["Close"], errors="coerce").dropna()
@@ -359,7 +450,16 @@ def predict_prices_ml_lr(ticker: str, days: int) -> Tuple[List[float], float, fl
     rsi = compute_rsi(close, 14)
     vol_proxy = compute_volatility_proxy(close, 14)
 
-    return preds_prices, last_price, r2, mu, sigma, future_dates, rsi, vol_proxy
+    # ✅ MAE backtest for this horizon (1d or 7d)
+    mae_price, mae_percent = backtest_mae_price(
+        close=close,
+        horizon_days=days,
+        lags=LAGS,
+        train_window=TRAIN_WINDOW,
+        test_points=MAE_TEST_POINTS,
+    )
+
+    return preds_prices, last_price, r2, mu, sigma, future_dates, rsi, vol_proxy, mae_price, mae_percent
 
 
 # ======================
@@ -375,6 +475,8 @@ def llm_explain_prediction(
     sigma: float,
     rsi: float,
     vol_proxy: float,
+    mae_price: float,
+    mae_percent: float,
     news_top: List[dict],
 ) -> str:
     if not openai_available():
@@ -384,7 +486,6 @@ def llm_explain_prediction(
     direction = "UP" if dayN > last_price else "DOWN"
     delta = dayN - last_price
 
-    # compact news context
     news_lines = []
     for it in news_top[:3]:
         title = it.get("title", "")
@@ -395,6 +496,9 @@ def llm_explain_prediction(
             f"- title: {title}\n  tags: {tags}\n  score: {score}\n  excerpt: {shorten(excerpt, 220)}"
         )
     news_block = "\n".join(news_lines) if news_lines else "NO RECENT NEWS ITEMS AVAILABLE."
+
+    mae_line = "MAE backtest: unavailable" if (np.isnan(mae_price) or np.isnan(mae_percent)) else \
+        f"MAE backtest (price): {mae_price:.2f} | MAE%: {mae_percent:.2f}%"
 
     prompt = f"""
 You are helping explain a stock forecast for an educational Telegram bot.
@@ -418,6 +522,7 @@ AI model used for forecast:
 - R2 on training: {r2*100:.1f}%
 - mean daily return (mu): {mu*100:.3f}%
 - daily volatility (sigma): {sigma*100:.3f}%
+- {mae_line}
 
 Indicators:
 - RSI(14): {rsi:.1f}
@@ -482,11 +587,15 @@ def build_predict_text_html(
     preds: List[float],
     last_price: float,
     r2: float,
+    mae_price: float,
+    mae_percent: float,
     future_dates: List[pd.Timestamp],
     rule_reasoning: str,
     ai_reasoning: str,
 ) -> str:
     kz_time = datetime.now(timezone.utc) + timedelta(hours=5)
+
+    mae_txt = "N/A" if (np.isnan(mae_price) or np.isnan(mae_percent)) else f"{mae_price:.2f} ({mae_percent:.2f}%)"
 
     if mode == "1d":
         predicted = preds[0]
@@ -499,7 +608,8 @@ def build_predict_text_html(
             f"Predicted next close: <code>{predicted:.2f}</code>\n"
             f"Move (approx): <code>{delta:+.2f}</code>\n"
             f"Direction: <b>{direction}</b>\n"
-            f"Model (Linear Regression) R²: <code>{r2*100:.1f}%</code>\n\n"
+            f"Model (Linear Regression) R²: <code>{r2*100:.1f}%</code>\n"
+            f"Backtest MAE (1D): <code>{mae_txt}</code>\n\n"
         )
     else:
         dayN = preds[-1]
@@ -512,7 +622,8 @@ def build_predict_text_html(
             f"Day 7 prediction: <code>{dayN:.2f}</code>\n"
             f"Move (approx): <code>{deltaN:+.2f}</code>\n"
             f"Direction: <b>{direction}</b>\n"
-            f"Model (Linear Regression) R²: <code>{r2*100:.1f}%</code>\n\n"
+            f"Model (Linear Regression) R²: <code>{r2*100:.1f}%</code>\n"
+            f"Backtest MAE (7D): <code>{mae_txt}</code>\n\n"
         )
 
         path_lines = []
@@ -533,7 +644,6 @@ def build_predict_text_html(
 
 
 def rule_based_reasoning(mu: float, sigma: float, rsi: float, vol_proxy: float, news_avg: float, news_count: int) -> str:
-    # Simple, transparent reasoning
     trend = "upward" if mu > 0 else "downward" if mu < 0 else "flat"
     trend_score = 1 if mu > 0 else -1 if mu < 0 else 0
 
@@ -578,7 +688,7 @@ def rule_based_reasoning(mu: float, sigma: float, rsi: float, vol_proxy: float, 
 def do_predict(ticker: str, mode: str) -> str:
     days = 1 if mode == "1d" else 7
 
-    preds, last_price, r2, mu, sigma, future_dates, rsi, vol_proxy = predict_prices_ml_lr(ticker, days=days)
+    preds, last_price, r2, mu, sigma, future_dates, rsi, vol_proxy, mae_price, mae_percent = predict_prices_ml_lr(ticker, days=days)
 
     news = fetch_news_yahoo(ticker)
     news_avg, top_items, used_count = analyze_news(news, lookback_days=NEWS_LOOKBACK_DAYS, limit=NEWS_LIMIT)
@@ -595,6 +705,8 @@ def do_predict(ticker: str, mode: str) -> str:
         sigma=sigma,
         rsi=rsi,
         vol_proxy=vol_proxy,
+        mae_price=mae_price,
+        mae_percent=mae_percent,
         news_top=top_items,
     )
 
@@ -604,6 +716,8 @@ def do_predict(ticker: str, mode: str) -> str:
         preds=preds,
         last_price=last_price,
         r2=r2,
+        mae_price=mae_price,
+        mae_percent=mae_percent,
         future_dates=future_dates,
         rule_reasoning=rule_reason,
         ai_reasoning=ai_reason,
@@ -637,6 +751,7 @@ def status(message):
         f"Tickers: {', '.join(sorted(ALLOWED_TICKERS))}\n"
         f"Predict command: /predict <TICKER> <1d|7d>\n"
         f"Model: Linear Regression (lagged returns)\n"
+        f"Backtest MAE: walk-forward (last {MAE_TEST_POINTS} points)\n"
         f"{ai_status}"
     )
     bot.send_message(message.chat.id, txt)
@@ -668,10 +783,8 @@ def predict_command(message):
         bot.send_message(message.chat.id, f"Error: {e}")
 
 
-# Any other message -> OpenAI assistant reply (no mode)
 @bot.message_handler(func=lambda m: True)
 def any_text(message):
-    # If user types something that looks like /predict but wrong format:
     if message.text and message.text.strip().startswith("/predict"):
         bot.send_message(message.chat.id, "Format: /predict META 1d  OR  /predict META 7d")
         return
@@ -690,7 +803,10 @@ def callback_handler(call):
             ai_status = "✅ OpenAI enabled" if openai_available() else "❌ OpenAI not configured (set OPENAI_API_KEY)"
             bot.send_message(
                 call.message.chat.id,
-                f"✅ Bot RUNNING\nTickers: {', '.join(sorted(ALLOWED_TICKERS))}\nModel: Linear Regression (lagged returns)\n{ai_status}"
+                f"✅ Bot RUNNING\nTickers: {', '.join(sorted(ALLOWED_TICKERS))}\n"
+                f"Model: Linear Regression (lagged returns)\n"
+                f"Backtest MAE: walk-forward (last {MAE_TEST_POINTS} points)\n"
+                f"{ai_status}"
             )
             return
 
@@ -715,5 +831,5 @@ def callback_handler(call):
 # RUN
 # ======================
 if __name__ == "__main__":
-    print("Bot started ✅ (ML Linear Regression predictor + OpenAI assistant)")
+    print("Bot started ✅ (ML Linear Regression predictor + OpenAI assistant + MAE backtest)")
     bot.infinity_polling()
